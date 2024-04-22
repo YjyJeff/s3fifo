@@ -1,0 +1,30 @@
+[package]
+name = "s3fifo"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+hashbrown = { version = "0.14", features = ["raw", "inline-more"] }
+
+[dev-dependencies]
+rand = "0.8"
+rand_distr = "0.4.3"
+lru = "0.12.3"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+bare_urls = "deny"
+private_intra_doc_links = "deny"
+
+[lints.rust]
+rust_2018_idioms = "deny"
+missing_docs = "deny"
+single_use_lifetimes = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+todo = "warn"
+needless_borrow = "deny"
+redundant_clone = "deny"
