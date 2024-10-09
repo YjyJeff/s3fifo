@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-hashbrown = { version = "0.14", features = ["raw", "inline-more"] }
+hashbrown = "0.15"
 
 [dev-dependencies]
 rand = "0.8"
@@ -19,7 +19,6 @@ bare_urls = "deny"
 private_intra_doc_links = "deny"
 
 [lints.rust]
-rust_2018_idioms = "deny"
 missing_docs = "deny"
 single_use_lifetimes = "warn"
 unreachable_pub = "warn"

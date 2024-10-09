@@ -3,12 +3,11 @@
 //! [paper]: https://dl.acm.org/doi/10.1145/3600006.3613147
 
 use std::collections::VecDeque;
-use std::fmt::Debug;
 use std::hash::{BuildHasher, Hash};
 use std::mem;
 
-use hashbrown::hash_map::DefaultHashBuilder;
-use hashbrown::raw::RawTable;
+use hashbrown::hash_table::HashTable;
+use hashbrown::DefaultHashBuilder;
 
 type HashValue = u64;
 
@@ -22,7 +21,7 @@ pub struct S3FIFO<K, V, S = DefaultHashBuilder> {
 
 impl<K, V> S3FIFO<K, V, DefaultHashBuilder>
 where
-    K: Eq + Hash + Debug,
+    K: Eq + Hash,
 {
     /// Create a new `S3FIFO`
     pub fn new(cap: usize) -> Self {
@@ -32,7 +31,7 @@ where
 
 impl<K, V, S> S3FIFO<K, V, S>
 where
-    K: Eq + Hash + Debug,
+    K: Eq + Hash,
     S: BuildHasher,
 {
     /// Create a new empty `S3FIFO` with hash builder
@@ -42,8 +41,8 @@ where
         let ghost_size = main_size;
         S3FIFO {
             hash_builder,
-            small_fifo: FIFOCache::new(small_size, "small"),
-            main_fifo: FIFOCache::new(main_size, "main"),
+            small_fifo: FIFOCache::new(small_size),
+            main_fifo: FIFOCache::new(main_size),
             ghost_fifo: GhostFIFOCache::new(ghost_size),
         }
     }
@@ -124,9 +123,8 @@ where
 }
 
 struct FIFOCache<K, V> {
-    name: &'static str,
     /// Hash table for fast look up
-    table: RawTable<Bucket<K, V>>,
+    table: HashTable<Bucket<K, V>>,
     /// FIFO queue contains the key in the map. It is used to preserve the FIFO order of
     /// the map
     ring_buffer: VecDeque<(K, HashValue)>,
@@ -134,12 +132,11 @@ struct FIFOCache<K, V> {
 
 impl<K, V> FIFOCache<K, V>
 where
-    K: Eq + Hash + Debug,
+    K: Eq + Hash,
 {
-    fn new(cap: usize, name: &'static str) -> Self {
+    fn new(cap: usize) -> Self {
         Self {
-            name,
-            table: RawTable::with_capacity(cap),
+            table: HashTable::with_capacity(cap),
             ring_buffer: VecDeque::with_capacity(cap),
         }
     }
@@ -147,7 +144,7 @@ where
     #[inline]
     fn get(&mut self, k: &K, hash: HashValue) -> Option<&V> {
         self.table
-            .get_mut(hash, |probe_bucket| unsafe {
+            .find_mut(hash, |probe_bucket| unsafe {
                 (*probe_bucket.key_ptr).eq(k)
             })
             .map(|element| {
@@ -159,7 +156,7 @@ where
     #[inline]
     fn get_mut(&mut self, k: &K, hash: HashValue) -> Option<&mut V> {
         self.table
-            .get_mut(hash, |probe_bucket| unsafe {
+            .find_mut(hash, |probe_bucket| unsafe {
                 (*probe_bucket.key_ptr).eq(k)
             })
             .map(|element| {
@@ -190,7 +187,7 @@ where
             None => {
                 self.ring_buffer.push_back((k, hash));
                 let key_ptr: *const K = &self.ring_buffer.back().unwrap().0;
-                self.table.insert(
+                self.table.insert_unique(
                     hash,
                     Bucket {
                         key_ptr,
@@ -206,12 +203,12 @@ where
     #[inline]
     fn pop(&mut self) -> Option<(K, V, u8, HashValue)> {
         self.ring_buffer.pop_front().map(|(key, hash)| unsafe {
-            let bucket = self
+            let entry = self
                 .table
-                .find(hash, |probe_bucket| (*probe_bucket.key_ptr).eq(&key))
-                .unwrap();
+                .find_entry(hash, |probe_bucket| (*probe_bucket.key_ptr).eq(&key))
+                .unwrap_unchecked();
 
-            let (bucket, _) = self.table.remove(bucket);
+            let (bucket, _) = entry.remove();
             (key, bucket.value, bucket.freq.saturating_sub(1), hash)
         })
     }
@@ -241,7 +238,7 @@ impl<K, V> Bucket<K, V> {
 /// FIXME: Redundant HashValue
 struct GhostFIFOCache {
     /// Hash table for fast look up
-    table: RawTable<HashValue>,
+    table: HashTable<HashValue>,
     /// FIFO queue contains the pointer to the map. The lifetime of the pointer is the
     /// lifetime of the K in the map. It is used to preserve the FIFO order of the map
     ring_buffer: VecDeque<HashValue>,
@@ -250,22 +247,14 @@ struct GhostFIFOCache {
 impl GhostFIFOCache {
     fn new(cap: usize) -> Self {
         Self {
-            table: RawTable::with_capacity(cap),
+            table: HashTable::with_capacity(cap),
             ring_buffer: VecDeque::with_capacity(cap),
         }
     }
 
     #[inline]
     fn contains(&self, hash: HashValue) -> bool {
-        self.table.get(hash, |&probe| probe == hash).is_some()
-    }
-
-    #[inline]
-    fn pop(&mut self) {
-        let garbage_hash = self.ring_buffer.pop_front().unwrap();
-
-        self.table
-            .remove_entry(garbage_hash, |&probe| probe == garbage_hash);
+        self.table.find(hash, |&probe| probe == hash).is_some()
     }
 
     #[inline]
@@ -276,11 +265,16 @@ impl GhostFIFOCache {
 
         if self.ring_buffer.len() == self.ring_buffer.capacity() {
             // full
-            self.pop();
+            let garbage_hash = self.ring_buffer.pop_front().unwrap();
+            let entry = self
+                .table
+                .find_entry(garbage_hash, |&probe| probe == garbage_hash)
+                .unwrap();
+            entry.remove();
         }
 
         self.ring_buffer.push_back(hash);
 
-        self.table.insert(hash, hash, |&probe| probe);
+        self.table.insert_unique(hash, hash, |&probe| probe);
     }
 }

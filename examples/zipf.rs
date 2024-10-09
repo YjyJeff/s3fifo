@@ -32,21 +32,21 @@ fn main() {
         hit_count as f64 / upper_bound as f64
     );
 
-    // // LRU
-    // let mut hit_count = 0;
-    // let mut cache = lru::LruCache::new(std::num::NonZeroUsize::new(cache_cap).unwrap());
-    // let now = std::time::Instant::now();
-    // for &key in keys.iter() {
-    //     if cache.get(&key).is_some() {
-    //         hit_count += 1;
-    //     } else {
-    //         cache.put(key, ());
-    //     }
-    // }
+    // LRU
+    let mut hit_count = 0;
+    let mut cache = lru::LruCache::new(std::num::NonZeroUsize::new(cache_cap).unwrap());
+    let now = std::time::Instant::now();
+    for &key in keys.iter() {
+        if cache.get(&key).is_some() {
+            hit_count += 1;
+        } else {
+            cache.put(key, ());
+        }
+    }
 
-    // println!(
-    //     "LRU elapsed: {:?}. hit ratio: {}",
-    //     now.elapsed(),
-    //     hit_count as f64 / upper_bound as f64
-    // );
+    println!(
+        "LRU elapsed: {:?}. hit ratio: {}",
+        now.elapsed(),
+        hit_count as f64 / upper_bound as f64
+    );
 }
