@@ -3,6 +3,7 @@
 //! [paper]: https://dl.acm.org/doi/10.1145/3600006.3613147
 
 use std::collections::VecDeque;
+use std::fmt::Debug;
 use std::hash::{BuildHasher, Hash};
 use std::mem;
 
@@ -14,14 +15,15 @@ type HashValue = u64;
 /// A non-thread safe `S3FIFO` cache
 pub struct S3FIFO<K, V, S = DefaultHashBuilder> {
     hash_builder: S,
-    small_fifo: FIFOCache<K, V>,
-    main_fifo: FIFOCache<K, V>,
+    small_fifo: VecDeque<(K, HashValue)>,
+    main_fifo: VecDeque<(K, HashValue)>,
     ghost_fifo: GhostFIFOCache,
+    table: HashTable<Bucket<K, V>>,
 }
 
 impl<K, V> S3FIFO<K, V, DefaultHashBuilder>
 where
-    K: Eq + Hash,
+    K: Eq + Hash + Debug,
 {
     /// Create a new `S3FIFO`
     pub fn new(cap: usize) -> Self {
@@ -31,7 +33,7 @@ where
 
 impl<K, V, S> S3FIFO<K, V, S>
 where
-    K: Eq + Hash,
+    K: Eq + Hash + Debug,
     S: BuildHasher,
 {
     /// Create a new empty `S3FIFO` with hash builder
@@ -41,34 +43,37 @@ where
         let ghost_size = main_size;
         S3FIFO {
             hash_builder,
-            small_fifo: FIFOCache::new(small_size),
-            main_fifo: FIFOCache::new(main_size),
+            small_fifo: VecDeque::with_capacity(small_size),
+            main_fifo: VecDeque::with_capacity(main_size),
             ghost_fifo: GhostFIFOCache::new(ghost_size),
+            table: HashTable::with_capacity(10 * cap),
         }
     }
 
     /// Get the value with given key
     pub fn get(&mut self, k: &K) -> Option<&V> {
         let hash = self.hash_builder.hash_one(k);
-        if let Some(value) = self.small_fifo.get(k, hash) {
-            Some(value)
-        } else if let Some(value) = self.main_fifo.get(k, hash) {
-            Some(value)
-        } else {
-            None
-        }
+        self.table
+            .find_mut(hash, |probe_bucket| unsafe {
+                (*probe_bucket.key_ptr).eq(k)
+            })
+            .map(|element| {
+                element.incr_freq();
+                &element.value
+            })
     }
 
     /// Get the mutable reference with given key
     pub fn get_mut(&mut self, k: &K) -> Option<&mut V> {
         let hash = self.hash_builder.hash_one(k);
-        if let Some(value) = self.small_fifo.get_mut(k, hash) {
-            Some(value)
-        } else if let Some(value) = self.main_fifo.get_mut(k, hash) {
-            Some(value)
-        } else {
-            None
-        }
+        self.table
+            .find_mut(hash, |probe_bucket| unsafe {
+                (*probe_bucket.key_ptr).eq(k)
+            })
+            .map(|element| {
+                element.incr_freq();
+                &mut element.value
+            })
     }
 
     /// Put the key-value pair into the cache. If the cache is has this key present
@@ -81,15 +86,70 @@ where
         let hash = self.hash_builder.hash_one(&k);
 
         if self.ghost_fifo.contains(hash) {
-            if self.main_fifo.is_full() {
+            println!("Ghost");
+            if self.main_fifo.len() == self.main_fifo.capacity() {
+                println!("Ghost len: {}", self.ghost_fifo.ring_buffer.len());
+                self.assert_main_fifo();
                 self.evict_main();
+                println!("After evict main");
+                self.assert_main_fifo();
             }
-            self.main_fifo.insert(k, v, 0, hash, &self.hash_builder);
+            self.main_fifo.push_back((k, hash));
+            let key_ptr: *const K = &self.main_fifo.back().unwrap().0;
+            self.table.insert_unique(
+                hash,
+                Bucket {
+                    key_ptr,
+                    value: v,
+                    freq: 0,
+                },
+                |bucket| self.hash_builder.hash_one(unsafe { &*bucket.key_ptr }),
+            );
         } else {
-            if self.small_fifo.is_full() {
+            if self.small_fifo.len() == self.small_fifo.capacity() {
+                println!("Before evict small");
+                self.assert_main_fifo();
                 self.evict_small();
+                println!("After evict small");
+                self.assert_main_fifo();
             }
-            self.small_fifo.insert(k, v, 0, hash, &self.hash_builder);
+            assert!(self.small_fifo.len() != self.small_fifo.capacity());
+            unsafe {
+                assert!(self
+                    .table
+                    .find(hash, |probe_bucket| (*probe_bucket.key_ptr).eq(&k))
+                    .is_none());
+            }
+            println!("aaaaa");
+            self.assert_main_fifo();
+            println!("bbbbbb");
+            println!("key: {:?}, Hash: {}", k, hash);
+            self.small_fifo.push_back((k, hash));
+            let key_ptr: *const K = &self.small_fifo.back().unwrap().0;
+            println!("Small size: {}", self.small_fifo.len());
+            println!("Main size: {}", self.main_fifo.len());
+            println!("table len: {}", self.table.len());
+            for e in self.main_fifo.iter() {
+                print!("e.key: {:?},e.hash in main: {}", e.0, e.1);
+            }
+            println!();
+            self.table.insert_unique(
+                hash,
+                Bucket {
+                    key_ptr,
+                    value: v,
+                    freq: 0,
+                },
+                |bucket| {
+                    println!("Rehash");
+                    self.hash_builder.hash_one(unsafe { &*bucket.key_ptr })
+                },
+            );
+            println!("After Insert");
+            println!("table len: {}", self.table.len());
+            // WTF? After insert, we can not find main in the hashmap
+            self.assert_main_fifo();
+            println!("llll")
         }
 
         None
@@ -97,26 +157,72 @@ where
 
     #[inline]
     fn evict_small(&mut self) {
-        while let Some((k, v, freq, hash)) = self.small_fifo.pop() {
-            if freq > 0 {
-                if self.main_fifo.is_full() {
-                    self.evict_main();
+        println!("Evict small");
+        unsafe {
+            while let Some((key, hash)) = self.small_fifo.pop_front() {
+                match self
+                    .table
+                    .find_entry(hash, |probe_bucket| (*probe_bucket.key_ptr).eq(&key))
+                {
+                    Ok(mut entry) => {
+                        let bucket_mut = entry.get_mut();
+                        let freq = bucket_mut.freq.saturating_sub(1);
+                        bucket_mut.freq = freq;
+                        if freq > 0 {
+                            if self.main_fifo.len() == self.main_fifo.capacity() {
+                                self.evict_main();
+                                println!("After evict main in evict_small");
+                                self.assert_main_fifo();
+                            }
+                            self.main_fifo.push_back((key, hash));
+                        } else {
+                            println!("Before Remove");
+                            // self.assert_main_fifo();
+                            entry.remove();
+                            self.assert_main_fifo();
+
+                            self.ghost_fifo.insert(hash);
+                            return;
+                        }
+                    }
+                    Err(_) => unreachable!("Key in small FIFO must in table"),
                 }
-                self.main_fifo.insert(k, v, freq, hash, &self.hash_builder);
-            } else {
-                self.ghost_fifo.insert(hash);
-                return;
             }
         }
     }
 
     #[inline]
     fn evict_main(&mut self) {
-        while let Some((k, v, freq, hash)) = self.main_fifo.pop() {
-            if freq > 0 {
-                self.main_fifo.insert(k, v, freq, hash, &self.hash_builder);
-            } else {
-                return;
+        unsafe {
+            while let Some((key, hash)) = self.main_fifo.pop_front() {
+                match self
+                    .table
+                    .find_entry(hash, |probe_bucket| (*probe_bucket.key_ptr).eq(&key))
+                {
+                    Ok(mut entry) => {
+                        let bucket_mut = entry.get_mut();
+                        let freq = bucket_mut.freq.saturating_sub(1);
+                        bucket_mut.freq = freq;
+                        if freq > 0 {
+                            self.main_fifo.push_back((key, hash));
+                        } else {
+                            entry.remove();
+                            return;
+                        }
+                    }
+                    Err(_) => unreachable!("Key in main FIFO must in table"),
+                }
+            }
+        }
+    }
+
+    fn assert_main_fifo(&self) {
+        for e in self.main_fifo.iter() {
+            unsafe {
+                assert!(self
+                    .table
+                    .find(e.1, |probe_bucket| (*probe_bucket.key_ptr).eq(&e.0))
+                    .is_some());
             }
         }
     }
