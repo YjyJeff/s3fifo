@@ -7,7 +7,7 @@ use std::time::Duration;
 fn main() {
     let upper_bound: u64 = 1_000_000;
     let cache_cap = upper_bound as usize / 100;
-    let zipf_distr = rand_distr::Zipf::new(upper_bound, 0.75).unwrap();
+    let zipf_distr = rand_distr::Zipf::new(upper_bound, 0.99).unwrap();
     let rng = rand::thread_rng();
     let mut iter = rng.sample_iter(zipf_distr);
 
